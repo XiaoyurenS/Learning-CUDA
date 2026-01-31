@@ -19,8 +19,97 @@
  */
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+  const size_t n = rows < cols ? rows : cols;
+
+  if (n == 0) {
+    return T(0);
+  } else {
+    size_t bytes = rows * cols * sizeof(T);
+    T* d_input;
+    T* d_out;
+
+    cudaMalloc(&d_input, bytes);
+    cudaMalloc(&d_out, sizeof(T));
+
+    cudaMemcpy(d_input, h_input.data(), bytes, cudaMemcpyHostToDevice);
+
+    size_t block = 256;
+    size_t grid = (n + block -1) / block < 1024 ? (n + block -1) / block : 1024;
+    size_t smem_size = block * sizeof(T);
+
+    T* d_partials;
+    cudaMalloc(&d_partials, grid * sizeof(T));
+    cudaMemset(d_out, 0, sizeof(T));
+
+    trace_cuda<<<grid, block, smem_size>>>(d_input, n, cols, d_partials);
+
+    reduce_partias<<<1, block, smem_size>>>(d_partials, grid, d_out);
+
+    T h_out = T(0);
+    cudaMemcpy(&h_out, d_out, sizeof(T), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_input);
+    cudaFree(d_out);
+    cudaFree(d_partials);
+
+    return h_out;
+  }
+}
+
+template <typename T>
+__global__ void trace_cuda(const T* d_input, size_t n, size_t cols, T* d_partials) {
+  __shared__ T sdata[256];
+  size_t tid = threadIdx.x;
+  size_t idx = blockIdx.x * blockDim.x + tid;
+  size_t stride = blockDim.x * gridDim.x;
+
+  T local_sum = 0;
+  for (size_t i = idx; i < n; i += stride) {
+    local_sum += d_input[i * cols + i];
+  }
+
+  T block_sum = block_reduce(local_sum, sdata);
+
+  if (tid == 0) {
+    d_partials[blockIdx.x] = block_sum;
+  }
+}
+
+template <typename T>
+__global__ void reduce_partias(const T* d_partials, size_t num_partials, T* d_out){
+  __shared__ T sdata[256];
+  size_t tid = threadIdx.x;
+
+  T local_sum = 0;
+  for (size_t i = tid; i < num_partials; i += blockDim.x) {
+    local_sum += d_partials[i];
+  }
+
+  T block_sum = block_reduce(local_sum, sdata);
+
+  if (tid == 0) {
+    d_out[0] = block_sum;
+  }
+}
+
+template <typename T>
+__device__ T block_reduce(T val, T* sdata) {
+  size_t tid = threadIdx.x;
+
+  sdata[tid] = val;
+  __syncthreads();
+
+  size_t stride = blockDim.x / 2;
+
+  while (stride > 0) {
+    if (tid < stride) {
+      sdata[tid] = sdata[tid] + sdata[tid + stride];
+    }
+    __syncthreads();
+    stride = stride  / 2;
+  }
+
+  return sdata[0];
 }
 
 /**
