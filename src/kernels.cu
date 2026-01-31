@@ -17,6 +17,16 @@
  * @param cols Number of columns in the matrix.
  * @return The trace (sum of diagonal values) of the matrix.
  */
+
+ template <typename T>
+__device__ T block_reduce(T val, T* sdata);
+
+template <typename T>
+__global__ void trace_cuda(const T* d_input, size_t n, size_t cols, T* d_partials);
+
+template <typename T>
+__global__ void reduce_partials(const T* d_partials, size_t num_partials, T* d_out);
+
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   const size_t n = rows < cols ? rows : cols;
@@ -43,7 +53,7 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 
     trace_cuda<<<grid, block, smem_size>>>(d_input, n, cols, d_partials);
 
-    reduce_partias<<<1, block, smem_size>>>(d_partials, grid, d_out);
+    reduce_partials<<<1, block, smem_size>>>(d_partials, grid, d_out);
 
     T h_out = T(0);
     cudaMemcpy(&h_out, d_out, sizeof(T), cudaMemcpyDeviceToHost);
@@ -76,7 +86,7 @@ __global__ void trace_cuda(const T* d_input, size_t n, size_t cols, T* d_partial
 }
 
 template <typename T>
-__global__ void reduce_partias(const T* d_partials, size_t num_partials, T* d_out){
+__global__ void reduce_partials(const T* d_partials, size_t num_partials, T* d_out){
   __shared__ T sdata[256];
   size_t tid = threadIdx.x;
 
