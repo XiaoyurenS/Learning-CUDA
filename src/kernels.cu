@@ -3,6 +3,9 @@
 
 #include "../tester/utils.h"
 
+#include <type_traits>
+#include <cmath>
+
 /**
  * @brief Computes the trace of a matrix.
  *
@@ -56,7 +59,7 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
     cudaMalloc(&d_partials, grid * sizeof(T));
     cudaMemset(d_out, 0, sizeof(T));
 
-    // cuda launch
+    // launch kernel
     trace_cuda<<<grid, block, smem_size>>>(d_input, n, cols, d_partials);
 
     reduce_partials<<<1, block, smem_size>>>(d_partials, grid, d_out);
@@ -156,11 +159,272 @@ __device__ T block_reduce(T val, T* sdata) {
  * @param[in] is_causal Whether to apply causal masking
  */
 template <typename T>
+__global__ void cuda_flashAttention(
+  const T* d_q, const T* d_k, const T* d_v, T* d_o, 
+  int batch_size, int target_seq_len, int src_seq_len, int query_heads, int kv_heads, int head_dim, 
+  bool is_causal
+);
+
+template <typename T>
+__device__ float to_float(T x);
+
+template <typename T>
+__device__ T from_float(float x);
+
+__device__ float block_reduce_max(float val, float* sdata);
+
+__device__ float block_reduce_sum(float val, float* sdata);
+
+template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
                     int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {     
+  // 快速处理边界
+  if (batch_size <= 0 || target_seq_len <= 0 || query_heads <= 0 || head_dim <= 0) {
+    h_o.clear();
+    return;
+  }
+  if (src_seq_len <= 0 || kv_heads <= 0) {
+    // 没有 key/value：输出可以全 0
+    h_o.assign((size_t)batch_size * target_seq_len * query_heads * head_dim, T(0));
+    return;
+  }                    
+  
+  // 计算输入的总元素数
+  size_t total_qo_elems = batch_size * target_seq_len * query_heads * head_dim;
+  size_t total_kv_elems = batch_size * src_seq_len * kv_heads * head_dim;
+
+  size_t qo_bytes = total_qo_elems * sizeof(T);
+  size_t kv_bytes = total_kv_elems * sizeof(T);
+
+  // 尺寸检查
+  if (h_q.size() != total_qo_elems || h_k.size() != total_kv_elems || h_v.size() != total_kv_elems) {
+    printf("flashAttention input size mismatch\n");
+    return;
+  }
+
+  // 如果 h_o 的大小不对，就调整到正确大小
+  if (h_o.size() != total_qo_elems) {
+    h_o.resize(total_qo_elems);
+  }
+
+  // 声明 device 输入与输出变量
+  T* d_q;
+  T* d_k;
+  T* d_v;
+  T* d_o;
+
+  // 分配输入与输出内存
+  cudaMalloc(&d_q, qo_bytes);
+  cudaMalloc(&d_k, kv_bytes);
+  cudaMalloc(&d_v, kv_bytes);
+  cudaMalloc(&d_o, qo_bytes);
+
+  // 拷贝输入至 device
+  cudaMemcpy(d_q, h_q.data(), qo_bytes, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_k, h_k.data(), kv_bytes, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_v, h_v.data(), kv_bytes, cudaMemcpyHostToDevice);
+
+  // 清零 d_o
+  cudaMemset(d_o, 0, qo_bytes);
+
+  // 设置 grid，block，shared memory
+  dim3 grid(batch_size, target_seq_len, query_heads);
+  dim3 block(256);
+  size_t smem_size = 0;
+  
+  // launch kernel
+  cuda_flashAttention<<<grid, block, smem_size>>>(
+    d_q, d_k, d_v, d_o, 
+    batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim, 
+    is_causal
+  );
+
+  // 从 device 写回结果
+  cudaMemcpy(h_o.data(), d_o, qo_bytes, cudaMemcpyDeviceToHost);
+
+  // 释放 cuda 内存
+  cudaFree(d_q);
+  cudaFree(d_k);
+  cudaFree(d_v);
+  cudaFree(d_o);
+
+  return;
+}
+
+template <typename T>
+__global__ void cuda_flashAttention(
+  const T* d_q, const T* d_k, const T* d_v, T* d_o, 
+  int batch_size, int target_seq_len, int src_seq_len, int query_heads, int kv_heads, int head_dim, 
+  bool is_causal
+) {
+  __shared__ float s_reduce[256];
+  __shared__ float s_m;
+  __shared__ float s_den;
+
+  // grid/block 映射
+  int b = (int)blockIdx.x;
+  int t = (int)blockIdx.y;
+  int qh = (int)blockIdx.z;
+  int tid = threadIdx.x;
+
+  int B = batch_size;
+  int Tt = target_seq_len;
+  int Ss = src_seq_len;
+
+  int QH = query_heads;
+  int KH = kv_heads;
+  int D = head_dim;
+
+  if (b >= B || t >= Tt || qh >= QH) return;
+  if (Ss <= 0 || D <= 0) return;
+
+  // GQA 映射
+  int kh;
+  if (KH == 1) {
+    kh = 0;
+  } else if (QH % KH == 0) {
+    size_t group = QH / KH;
+    kh = qh / group;
+  } else {
+    kh = qh % KH;
+  }
+  kh = min(kh, KH - 1);
+
+  int s_end = is_causal ? min(Ss - 1, t) : (Ss - 1);
+
+  size_t q_base = ((b * Tt + t) * QH + qh) * D;
+  size_t o_base = q_base;
+
+  const float scale = 1.0f / sqrtf((float)D);
+
+  // Step 1：计算 m = max score（block 内归约）
+  float thread_max = -1e20f;
+
+  for (size_t s = tid; s <= s_end; s += blockDim.x) {
+    // 计算 dot(q, k_s)
+    size_t k_base = ((b * Ss + s) * KH + kh) * D;
+    float dot = 0.0f;
+    for (size_t d = 0; d < D; ++d) {
+      dot += to_float(d_q[q_base + d]) * to_float(d_k[k_base + d]);
+    }
+    float score = dot * scale;
+    thread_max = thread_max >= score ? thread_max : score;
+  }
+  float m = block_reduce_max(thread_max, s_reduce);
+
+  if (tid == 0) {
+    s_m = m;
+  }
+  __syncthreads();
+  m = s_m;
+
+  // Step 2：计算 den = sum exp(score - m)（block 内归约）
+  float thread_den = 0.0f;
+
+  for (int s = tid; s <= s_end; s += blockDim.x) {
+    size_t k_base = ((b * Ss + s) * KH + kh) * D;
+    float dot = 0.0f;
+    for (int d = 0; d < D; ++d) {
+      dot += to_float(d_q[q_base + d]) * to_float(d_k[k_base + d]);
+    }
+    float score = dot * scale;
+    thread_den += expf(score - m);
+  }
+  float den = block_reduce_sum(thread_den, s_reduce);
+
+  if (tid == 0) {
+    s_den = den;
+  }
+  __syncthreads();
+  den = s_den;
+
+  // Step 3：算输出向量 o[d]（每线程负责多个 d）
+  // 每个线程先把自己负责的 out_accum[d] 初始化 0
+  for (int d = tid; d < D; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int s = 0; s <= s_end; ++s) {
+      size_t k_base = ((b * Ss + s) * KH + kh) * D;
+      size_t v_base = k_base;
+
+      float dot = 0.0f;
+      for (int dd = 0; dd < D; ++dd) {
+        dot += to_float(d_q[q_base + dd]) * to_float(d_k[k_base + dd]);
+      }
+      float score = dot * scale;
+      float w = expf(score - m) / den;
+
+      acc += w * to_float(d_v[v_base + d]);
+    }
+    d_o[o_base + d] = from_float<T>(acc);
+  }
+}
+
+template <typename T>
+__device__ float to_float(T x) {
+  if constexpr (std::is_same_v<T, half>) {
+    return __half2float(x);
+  } else {
+    return static_cast<float>(x);
+  }
+}
+
+template <typename T>
+__device__ T from_float(float x) {
+  if constexpr (std::is_same_v<T, half>) {
+    return __float2half(x);
+  } else {
+    return static_cast<float>(x);
+  }
+}
+
+__device__ float block_reduce_max(float val, float* sdata) {
+  // 声明 shared memory 缓冲区，shared 数组大小至少 blockDim.x
+  size_t tid = threadIdx.x;
+
+  // 每线程写入自己的局部和
+  sdata[tid] = val;
+  // 同步：确保所有线程都写完
+  __syncthreads();
+
+  // 树形归约：每轮减半
+  // stride 初始为 blockDim/2
+  size_t stride = blockDim.x / 2;
+  while (stride > 0) {
+    if (tid < stride) {
+      sdata[tid] = sdata[tid] >= sdata[tid + stride] ? sdata[tid] : sdata[tid + stride];
+    }
+    __syncthreads();
+    stride = stride  / 2;
+  }
+
+  // 返回 block_sum_max，即 sdata[0]
+  return sdata[0];
+}
+
+__device__ float block_reduce_sum(float val, float* sdata) {
+  // 声明 shared memory 缓冲区，shared 数组大小至少 blockDim.x
+  size_t tid = threadIdx.x;
+
+  // 每线程写入自己的局部和
+  sdata[tid] = val;
+  // 同步：确保所有线程都写完
+  __syncthreads();
+
+  // 树形归约：每轮减半
+  // stride 初始为 blockDim/2
+  size_t stride = blockDim.x / 2;
+  while (stride > 0) {
+    if (tid < stride) {
+      sdata[tid] = sdata[tid] + sdata[tid + stride];
+    }
+    __syncthreads();
+    stride = stride  / 2;
+  }
+
+  // 返回 block_sum，即 sdata[0]
+  return sdata[0];
 }
 
 // *********************************************************************
