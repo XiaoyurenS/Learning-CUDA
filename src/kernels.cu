@@ -175,6 +175,10 @@ __device__ float block_reduce_max(float val, float* sdata);
 
 __device__ float block_reduce_sum(float val, float* sdata);
 
+__device__ float warp_reduce_max(float v);
+
+__device__ float warp_reduce_sum(float v);
+
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
@@ -231,9 +235,16 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
   // 设置 grid，block，shared memory
   dim3 grid(batch_size, target_seq_len, query_heads);
-  dim3 block(256);
+  dim3 block(32);
   size_t smem_size = 0;
   
+  static bool printed = false;
+  if (!printed) {
+    printf("B=%d T=%d S=%d QH=%d KH=%d D=%d causal=%d\n",
+          batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim, (int)is_causal);
+    printed = true;
+  }
+
   // launch kernel
   cuda_flashAttention<<<grid, block, smem_size>>>(
     d_q, d_k, d_v, d_o, 
@@ -255,110 +266,117 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
 template <typename T>
 __global__ void cuda_flashAttention(
-  const T* d_q, const T* d_k, const T* d_v, T* d_o, 
-  int batch_size, int target_seq_len, int src_seq_len, int query_heads, int kv_heads, int head_dim, 
-  bool is_causal
+  const T* d_q, const T* d_k, const T* d_v, T* d_o,
+  int batch_size, int target_seq_len, int src_seq_len,
+  int query_heads, int kv_heads, int head_dim, bool is_causal
 ) {
-  __shared__ float s_reduce[256];
-  __shared__ float s_m;
-  __shared__ float s_den;
+  // warp-only
+  const int lane = threadIdx.x;
+  if (lane >= 32) return;
 
-  // grid/block 映射
-  int b = (int)blockIdx.x;
-  int t = (int)blockIdx.y;
-  int qh = (int)blockIdx.z;
-  int tid = threadIdx.x;
+  const int b  = (int)blockIdx.x;
+  const int t  = (int)blockIdx.y;
+  const int qh = (int)blockIdx.z;
 
-  int B = batch_size;
-  int Tt = target_seq_len;
-  int Ss = src_seq_len;
-
-  int QH = query_heads;
-  int KH = kv_heads;
-  int D = head_dim;
+  const int B  = batch_size;
+  const int Tt = target_seq_len;
+  const int Ss = src_seq_len;
+  const int QH = query_heads;
+  const int KH = kv_heads;
+  const int D  = head_dim;
 
   if (b >= B || t >= Tt || qh >= QH) return;
   if (Ss <= 0 || D <= 0) return;
 
   // GQA 映射
   int kh;
-  if (KH == 1) {
-    kh = 0;
-  } else if (QH % KH == 0) {
-    size_t group = QH / KH;
-    kh = qh / group;
-  } else {
-    kh = qh % KH;
-  }
-  kh = min(kh, KH - 1);
+  if (KH == 1) kh = 0;
+  else if (QH % KH == 0) kh = qh / (QH / KH);
+  else kh = qh % KH;
+  kh = kh < KH ? kh : (KH - 1);
 
-  int s_end = is_causal ? min(Ss - 1, t) : (Ss - 1);
+  // causal end
+  const int s_end = is_causal ? (t < (Ss - 1) ? t : (Ss - 1)) : (Ss - 1);
+  if (s_end < 0) return;
 
-  size_t q_base = ((b * Tt + t) * QH + qh) * D;
-  size_t o_base = q_base;
+  const size_t q_base = ((size_t)(b * Tt + t) * (size_t)QH + (size_t)qh) * (size_t)D;
+  const size_t o_base = q_base;
 
   const float scale = 1.0f / sqrtf((float)D);
 
-  // Step 1：计算 m = max score（block 内归约）
+  // 缓存 q 至共享内存
+  __shared__ float s_q[64];
+  for (int dd = lane; dd < D; dd += 32) {
+    s_q[dd] = to_float(d_q[q_base + (size_t)dd]);
+  }
+
+  // m = max(score)
   float thread_max = -1e20f;
+  for (int s = lane; s <= s_end; s += 32) {
+    const size_t k_base =
+        (((size_t)b * (size_t)Ss + (size_t)s) * (size_t)KH + (size_t)kh) * (size_t)D;
 
-  for (size_t s = tid; s <= s_end; s += blockDim.x) {
-    // 计算 dot(q, k_s)
-    size_t k_base = ((b * Ss + s) * KH + kh) * D;
     float dot = 0.0f;
-    for (size_t d = 0; d < D; ++d) {
-      dot += to_float(d_q[q_base + d]) * to_float(d_k[k_base + d]);
+    #pragma unroll
+    for (int dd = 0; dd < D; ++dd) {
+      dot += s_q[dd] * to_float(d_k[k_base + (size_t)dd]);
     }
-    float score = dot * scale;
-    thread_max = thread_max >= score ? thread_max : score;
+    const float score = dot * scale;
+    thread_max = thread_max > score ? thread_max : score;
   }
-  float m = block_reduce_max(thread_max, s_reduce);
 
-  if (tid == 0) {
-    s_m = m;
-  }
-  __syncthreads();
-  m = s_m;
+  float m = warp_reduce_max(thread_max);
+  m = __shfl_sync(0xffffffff, m, 0); // 广播 lane0
 
-  // Step 2：计算 den = sum exp(score - m)（block 内归约）
+  // den = sum(exp(score - m))
   float thread_den = 0.0f;
+  for (int s = lane; s <= s_end; s += 32) {
+    const size_t k_base =
+        (((size_t)b * (size_t)Ss + (size_t)s) * (size_t)KH + (size_t)kh) * (size_t)D;
 
-  for (int s = tid; s <= s_end; s += blockDim.x) {
-    size_t k_base = ((b * Ss + s) * KH + kh) * D;
     float dot = 0.0f;
-    for (int d = 0; d < D; ++d) {
-      dot += to_float(d_q[q_base + d]) * to_float(d_k[k_base + d]);
+    #pragma unroll
+    for (int dd = 0; dd < D; ++dd) {
+      dot += s_q[dd] * to_float(d_k[k_base + (size_t)dd]);
     }
-    float score = dot * scale;
+    const float score = dot * scale;
     thread_den += expf(score - m);
   }
-  float den = block_reduce_sum(thread_den, s_reduce);
 
-  if (tid == 0) {
-    s_den = den;
-  }
-  __syncthreads();
-  den = s_den;
+  float den = warp_reduce_sum(thread_den);
+  den = __shfl_sync(0xffffffff, den, 0);
 
-  // Step 3：算输出向量 o[d]（每线程负责多个 d）
-  // 每个线程先把自己负责的 out_accum[d] 初始化 0
-  for (int d = tid; d < D; d += blockDim.x) {
-    float acc = 0.0f;
-    for (int s = 0; s <= s_end; ++s) {
-      size_t k_base = ((b * Ss + s) * KH + kh) * D;
-      size_t v_base = k_base;
+  // output 
+  // 每个 lane 处理 d=lane，当 D > 32时 d=lane+32
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
 
+  const int d0 = lane;
+  const int d1 = lane + 32;
+
+  for (int s = 0; s <= s_end; ++s) {
+    const size_t k_base =
+        (((size_t)b * (size_t)Ss + (size_t)s) * (size_t)KH + (size_t)kh) * (size_t)D;
+    const size_t v_base = k_base;
+
+    float w = 0.0f;
+    if (lane == 0) {
       float dot = 0.0f;
       for (int dd = 0; dd < D; ++dd) {
-        dot += to_float(d_q[q_base + dd]) * to_float(d_k[k_base + dd]);
+        dot += s_q[dd] * to_float(d_k[k_base + (size_t)dd]);
       }
-      float score = dot * scale;
-      float w = expf(score - m) / den;
-
-      acc += w * to_float(d_v[v_base + d]);
+      const float score = dot * scale;
+      w = expf(score - m) / den;
     }
-    d_o[o_base + d] = from_float<T>(acc);
+    w = __shfl_sync(0xffffffff, w, 0);
+
+    // 在范围内，更新 d0/d1 的输出
+    if (d0 < D) acc0 += w * to_float(d_v[v_base + (size_t)d0]);
+    if (d1 < D) acc1 += w * to_float(d_v[v_base + (size_t)d1]);
   }
+
+  if (d0 < D) d_o[o_base + (size_t)d0] = from_float<T>(acc0);
+  if (d1 < D) d_o[o_base + (size_t)d1] = from_float<T>(acc1);
 }
 
 template <typename T>
@@ -375,7 +393,7 @@ __device__ T from_float(float x) {
   if constexpr (std::is_same_v<T, half>) {
     return __float2half(x);
   } else {
-    return static_cast<float>(x);
+    return static_cast<T>(x);
   }
 }
 
@@ -425,6 +443,22 @@ __device__ float block_reduce_sum(float val, float* sdata) {
 
   // 返回 block_sum，即 sdata[0]
   return sdata[0];
+}
+
+__device__ float warp_reduce_sum(float v) {
+  // warpSize == 32
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    v += __shfl_down_sync(0xffffffff, v, offset);
+  }
+  return v;
+}
+
+__device__ float warp_reduce_max(float v) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    float other = __shfl_down_sync(0xffffffff, v, offset);
+    v = v > other ? v : other;
+  }
+  return v;
 }
 
 // *********************************************************************
