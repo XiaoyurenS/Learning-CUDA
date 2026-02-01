@@ -304,8 +304,8 @@ __global__ void cuda_flashAttention(
 
   const float scale = 1.0f / sqrtf((float)D);
 
-  // 缓存 q 至共享内存
   __shared__ float s_q[64];
+  __shared__ float s_partial[32];
   for (int dd = lane; dd < D; dd += 32) {
     s_q[dd] = to_float(d_q[q_base + (size_t)dd]);
   }
@@ -351,32 +351,87 @@ __global__ void cuda_flashAttention(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
 
-  const int d0 = lane;
-  const int d1 = lane + 32;
+  const int d0 = lane * 2;
+  const int d1 = d0 + 1;
 
   for (int s = 0; s <= s_end; ++s) {
     const size_t k_base =
         (((size_t)b * (size_t)Ss + (size_t)s) * (size_t)KH + (size_t)kh) * (size_t)D;
     const size_t v_base = k_base;
-
+    
     float w = 0.0f;
-    if (lane == 0) {
-      float dot = 0.0f;
-      for (int dd = 0; dd < D; ++dd) {
-        dot += s_q[dd] * to_float(d_k[k_base + (size_t)dd]);
-      }
-      const float score = dot * scale;
-      w = expf(score - m) / den;
-    }
-    w = __shfl_sync(0xffffffff, w, 0);
 
-    // 在范围内，更新 d0/d1 的输出
-    if (d0 < D) acc0 += w * to_float(d_v[v_base + (size_t)d0]);
-    if (d1 < D) acc1 += w * to_float(d_v[v_base + (size_t)d1]);
+    if constexpr (std::is_same_v<T, float>) {
+      // ===== 精度优先：float 走 lane0 串行 dd=0..D-1 =====
+      if (lane == 0) {
+        float dot = 0.0f;
+        for (int dd = 0; dd < D; ++dd) {
+          dot += s_q[dd] * d_k[k_base + (size_t)dd];  // float 直接读
+        }
+        const float score = dot * scale;
+        w = expf(score - m) / den;
+      }
+      w = __shfl_sync(0xffffffff, w, 0);
+
+    } else {
+      // ===== 性能优先：half 走并行 partial + 固定顺序合并 =====
+      float partial = 0.0f;
+      for (int dd = lane; dd < D; dd += 32) {
+        partial += s_q[dd] * to_float(d_k[k_base + (size_t)dd]); // half->float
+      }
+      s_partial[lane] = partial;
+      __syncwarp();
+
+      if (lane == 0) {
+        float dot = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 32; ++i) {
+          dot += s_partial[i];
+        }
+        const float score = dot * scale;
+        w = expf(score - m) / den;
+      }
+      w = __shfl_sync(0xffffffff, w, 0);
+    }
+    // 所有 lane 都会执行到这里，w 已经广播为寄存器里的标量
+    if constexpr (std::is_same_v<T, half>) {
+      // half 路径：尽量 half2 load（要求 d0 是偶数——我们现在就是偶数）
+      if (d0 + 1 < D) {
+        // v_base + d0 是 half2 对齐的（cudaMalloc 对齐很大 + d0 偶数）
+        const half2 hv2 = *reinterpret_cast<const half2*>(d_v + v_base + (size_t)d0);
+        const float2 fv2 = __half22float2(hv2);
+        acc0 += w * fv2.x;
+        acc1 += w * fv2.y;
+      } else if (d0 < D) {
+        // D==1 或 D 为奇数时最后一个元素
+        acc0 += w * __half2float(d_v[v_base + (size_t)d0]);
+      }
+    } else {
+      // float 路径：float2 load（d0 偶数）
+      if (d0 + 1 < D) {
+        const float2 vv2 = *reinterpret_cast<const float2*>(d_v + v_base + (size_t)d0);
+        acc0 += w * vv2.x;
+        acc1 += w * vv2.y;
+      } else if (d0 < D) {
+        acc0 += w * d_v[v_base + (size_t)d0];
+      }
+    }
   }
 
-  if (d0 < D) d_o[o_base + (size_t)d0] = from_float<T>(acc0);
-  if (d1 < D) d_o[o_base + (size_t)d1] = from_float<T>(acc1);
+  if constexpr (std::is_same_v<T, half>) {
+    if (d0 + 1 < D) {
+      const half2 ho2 = __floats2half2_rn(acc0, acc1);
+      *reinterpret_cast<half2*>(d_o + o_base + (size_t)d0) = ho2;
+    } else if (d0 < D) {
+      d_o[o_base + (size_t)d0] = __float2half(acc0);
+    }
+  } else {
+    if (d0 + 1 < D) {
+      *reinterpret_cast<float2*>(d_o + o_base + (size_t)d0) = make_float2(acc0, acc1);
+    } else if (d0 < D) {
+      d_o[o_base + (size_t)d0] = acc0;
+    }
+  }
 }
 
 template <typename T>
