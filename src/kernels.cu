@@ -22,104 +22,16 @@
  */
 
 template <typename T>
-__device__ T block_reduce(T val, T* sdata);
+__device__ inline void atomic_add_T(T* addr, T val);
 
-template <typename T>
-__global__ void trace_cuda(const T* d_input, size_t n, size_t cols, T* d_partials);
+template <>
+__device__ inline void atomic_add_T<float>(float* addr, float val) { atomicAdd(addr, val); }
 
-template <typename T>
-__global__ void reduce_partials(const T* d_partials, size_t num_partials, T* d_out);
-
-template <typename T>
-T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // 计算对角线元素个数
-  const size_t n = rows < cols ? rows : cols;
-
-  if (n == 0) {
-    return T(0);
-  } else {
-    // 分配内存
-    size_t bytes = rows * cols * sizeof(T); // 计算输入的内存总开销
-    T* d_input; // 声明 device 输入
-    T* d_out; // 声明 device 输出
-
-    cudaMalloc(&d_input, bytes); // 分配输入内存
-    cudaMalloc(&d_out, sizeof(T)); // 分配输出内存
-
-    // 拷贝输入至 device
-    cudaMemcpy(d_input, h_input.data(), bytes, cudaMemcpyHostToDevice);
-
-    // 设置 grid，block，shared memory
-    size_t block = 256;
-    size_t grid = (n + block -1) / block < 1024 ? (n + block -1) / block : 1024;
-    size_t smem_size = block * sizeof(T);
-
-    // 声明中间变量与内存分配
-    T* d_partials;
-    cudaMalloc(&d_partials, grid * sizeof(T));
-    cudaMemset(d_out, 0, sizeof(T));
-
-    // launch kernel
-    trace_cuda<<<grid, block, smem_size>>>(d_input, n, cols, d_partials);
-
-    reduce_partials<<<1, block, smem_size>>>(d_partials, grid, d_out);
-
-    // 声明 host 结果，并从 device 写回结果
-    T h_out = T(0);
-    cudaMemcpy(&h_out, d_out, sizeof(T), cudaMemcpyDeviceToHost);
-
-    // 释放 cuda 内存
-    cudaFree(d_input);
-    cudaFree(d_out);
-    cudaFree(d_partials);
-
-    return h_out;
-  }
-}
-
-template <typename T>
-__global__ void trace_cuda(const T* d_input, size_t n, size_t cols, T* d_partials) {
-  __shared__ T sdata[256];
-  size_t tid = threadIdx.x;
-  size_t idx = blockIdx.x * blockDim.x + tid;
-  size_t stride = blockDim.x * gridDim.x;
-
-  // 每个线程：grid-stride 遍历 i：累加 d_input[i*cols+i] 到 local_sum
-  T local_sum = 0;
-  for (size_t i = idx; i < n; i += stride) {
-    local_sum += d_input[i * cols + i];
-  }
-
-  // 每个 block：block_reduce(local_sum) 得到 block_sum
-  T block_sum = block_reduce(local_sum, sdata);
-
-  if (tid == 0) {
-    d_partials[blockIdx.x] = block_sum;
-  }
-}
-
-template <typename T>
-__global__ void reduce_partials(const T* d_partials, size_t num_partials, T* d_out){
-  __shared__ T sdata[256];
-  size_t tid = threadIdx.x;
-
-  // 每个线程：grid-stride 遍历 i：累加 partials[i] 到 local_sum
-  T local_sum = 0;
-  for (size_t i = tid; i < num_partials; i += blockDim.x) {
-    local_sum += d_partials[i];
-  }
-
-  // 每个 block：block_reduce(local_sum) 得到 block_sum
-  T block_sum = block_reduce(local_sum, sdata);
-
-  if (tid == 0) {
-    d_out[0] = block_sum;
-  }
-}
+template <>
+__device__ inline void atomic_add_T<int>(int* addr, int val) { atomicAdd(addr, val); }
 
 template <typename T>
 __device__ T block_reduce(T val, T* sdata) {
-  // 声明 shared memory 缓冲区，shared 数组大小至少 blockDim.x
   size_t tid = threadIdx.x;
 
   // 每线程写入自己的局部和
@@ -140,6 +52,58 @@ __device__ T block_reduce(T val, T* sdata) {
 
   // 返回 block_sum，即 sdata[0]
   return sdata[0];
+}
+
+template <typename T>
+__global__ void trace_diag_atomic(const T* d_diag, size_t n, T* d_out) {
+  __shared__ T sdata[256];
+
+  const size_t tid = threadIdx.x;
+  const size_t idx = (size_t)blockIdx.x * blockDim.x + tid;
+  const size_t stride = (size_t)blockDim.x * gridDim.x;
+
+  T local = 0;
+  for (size_t i = idx; i < n; i += stride) local += d_diag[i];
+
+  const T block_sum = block_reduce(local, sdata);
+  if (tid == 0) atomic_add_T<T>(d_out, block_sum);
+}
+
+template <typename T>
+T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
+  const size_t n = rows < cols ? rows : cols;
+  if (n == 0) return T(0);
+
+  // 1) host 上提取对角线（O(n)）
+  std::vector<T> h_diag(n);
+  for (size_t i = 0; i < n; ++i) {
+    h_diag[i] = h_input[i * cols + i];
+  }
+
+  // 2) device 上只存 diag（n 个元素）
+  T* d_diag = nullptr;
+  T* d_out  = nullptr;
+  cudaMalloc(&d_diag, n * sizeof(T));
+  cudaMalloc(&d_out, sizeof(T));
+
+  cudaMemcpy(d_diag, h_diag.data(), n * sizeof(T), cudaMemcpyHostToDevice);
+  cudaMemset(d_out, 0, sizeof(T));
+
+  // 3) 单 kernel
+  const int block = 256;
+  int grid = (int)((n + block - 1) / block);
+  if (grid > 1024) grid = 1024;
+  if (grid < 1) grid = 1;
+
+  trace_diag_atomic<T><<<grid, block>>>(d_diag, n, d_out);
+
+  // 4) 拷回
+  T h_out{};
+  cudaMemcpy(&h_out, d_out, sizeof(T), cudaMemcpyDeviceToHost);
+
+  cudaFree(d_diag);
+  cudaFree(d_out);
+  return h_out;
 }
 
 /**
@@ -237,13 +201,6 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   dim3 grid(batch_size, target_seq_len, query_heads);
   dim3 block(32);
   size_t smem_size = 0;
-  
-  static bool printed = false;
-  if (!printed) {
-    printf("B=%d T=%d S=%d QH=%d KH=%d D=%d causal=%d\n",
-          batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim, (int)is_causal);
-    printed = true;
-  }
 
   // launch kernel
   cuda_flashAttention<<<grid, block, smem_size>>>(
@@ -477,7 +434,6 @@ __device__ float block_reduce_max(float val, float* sdata) {
 }
 
 __device__ float block_reduce_sum(float val, float* sdata) {
-  // 声明 shared memory 缓冲区，shared 数组大小至少 blockDim.x
   size_t tid = threadIdx.x;
 
   // 每线程写入自己的局部和
